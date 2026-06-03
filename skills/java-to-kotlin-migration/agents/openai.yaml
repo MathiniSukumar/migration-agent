@@ -1,0 +1,7 @@
+interface:
+  display_name: "Java to Kotlin Migration"
+  short_description: "Migrate Java files to Kotlin safely"
+  default_prompt: "Use $java-to-kotlin-migration to convert selected Java files to Kotlin while preserving behavior."
+
+policy:
+  allow_implicit_invocation: true
