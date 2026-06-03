@@ -1,0 +1,533 @@
+$ErrorActionPreference = "Stop"
+
+$RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
+$ServerName = "java-kotlin-migration"
+$ServerVersion = "0.1.0"
+$ProtocolVersion = "2025-06-18"
+
+function Write-JsonResponse {
+    param([object]$Message)
+    $json = $Message | ConvertTo-Json -Depth 30 -Compress
+    [Console]::Out.WriteLine($json)
+    [Console]::Out.Flush()
+}
+
+function New-JsonRpcResult {
+    param($Id, [object]$Result)
+    return [ordered]@{
+        jsonrpc = "2.0"
+        id = $Id
+        result = $Result
+    }
+}
+
+function New-JsonRpcError {
+    param($Id, [int]$Code, [string]$Message)
+    return [ordered]@{
+        jsonrpc = "2.0"
+        id = $Id
+        error = [ordered]@{
+            code = $Code
+            message = $Message
+        }
+    }
+}
+
+function New-ToolText {
+    param([string]$Text, [bool]$IsError = $false)
+    return [ordered]@{
+        content = @(
+            [ordered]@{
+                type = "text"
+                text = $Text
+            }
+        )
+        isError = $IsError
+    }
+}
+
+function Resolve-RepoPath {
+    param([string]$ProjectPath)
+
+    if ([string]::IsNullOrWhiteSpace($ProjectPath)) {
+        $candidate = $RepoRoot
+    } elseif ([System.IO.Path]::IsPathRooted($ProjectPath)) {
+        $candidate = $ProjectPath
+    } else {
+        $candidate = Join-Path $RepoRoot $ProjectPath
+    }
+
+    $full = [System.IO.Path]::GetFullPath($candidate)
+    $root = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd("\")
+
+    if (-not ($full.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + "\", [System.StringComparison]::OrdinalIgnoreCase))) {
+        throw "Path is outside repo root: $ProjectPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        throw "Project path does not exist or is not a folder: $ProjectPath"
+    }
+
+    return $full
+}
+
+function Get-RelativePath {
+    param([string]$Path)
+    $rootUri = [System.Uri]::new(([System.IO.Path]::GetFullPath($RepoRoot).TrimEnd("\") + "\"))
+    $pathUri = [System.Uri]::new([System.IO.Path]::GetFullPath($Path))
+    return [System.Uri]::UnescapeDataString($rootUri.MakeRelativeUri($pathUri).ToString()).Replace("/", "\")
+}
+
+function Test-IsIgnoredPath {
+    param([string]$Path)
+    return $Path -match "\\(target|build|node_modules|\.git|\.idea|out|\.gradle)\\"
+}
+
+function Get-JavaFiles {
+    param([string]$Root, [bool]$IncludeTests = $true, [int]$MaxFiles = 200)
+
+    $files = Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "*.java" -ErrorAction SilentlyContinue |
+        Where-Object {
+            -not (Test-IsIgnoredPath $_.FullName) -and
+            ($IncludeTests -or ($_.FullName -notmatch "\\src\\test\\"))
+        } |
+        Sort-Object FullName |
+        Select-Object -First $MaxFiles
+
+    return @($files)
+}
+
+function Get-KotlinFiles {
+    param([string]$Root)
+    return @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "*.kt" -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-IsIgnoredPath $_.FullName) } |
+        Sort-Object FullName)
+}
+
+function Read-TextFileSafe {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ""
+    }
+    return [System.IO.File]::ReadAllText($Path)
+}
+
+function Get-BuildFiles {
+    param([string]$Root)
+
+    $names = @("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat")
+    $files = foreach ($name in $names) {
+        Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+            Where-Object { -not (Test-IsIgnoredPath $_.FullName) }
+    }
+
+    return @($files | Sort-Object FullName)
+}
+
+function Tool-ReadSkill {
+    $skillRoot = Join-Path $RepoRoot ".agents\skills\java-to-kotlin-migration"
+    $skillFile = Join-Path $skillRoot "SKILL.md"
+    $referenceRoot = Join-Path $skillRoot "references"
+
+    if (-not (Test-Path -LiteralPath $skillFile -PathType Leaf)) {
+        return New-ToolText "Skill not found at $skillFile" $true
+    }
+
+    $refs = @()
+    if (Test-Path -LiteralPath $referenceRoot -PathType Container) {
+        $refs = @(Get-ChildItem -LiteralPath $referenceRoot -File -Filter "*.md" | Sort-Object Name | ForEach-Object { Get-RelativePath $_.FullName })
+    }
+
+    $text = @"
+Skill file:
+$(Get-RelativePath $skillFile)
+
+References:
+$($refs -join "`n")
+
+SKILL.md:
+$(Read-TextFileSafe $skillFile)
+"@
+    return New-ToolText $text
+}
+
+function Tool-ListJavaFiles {
+    param($ToolArgs)
+    $root = Resolve-RepoPath $ToolArgs.projectPath
+    $includeTests = if ($null -ne $ToolArgs.includeTests) { [bool]$ToolArgs.includeTests } else { $true }
+    $maxFiles = if ($ToolArgs.maxFiles) { [Math]::Min([int]$ToolArgs.maxFiles, 1000) } else { 200 }
+    $files = Get-JavaFiles $root $includeTests $maxFiles
+
+    $lines = @(
+        "Project: $(Get-RelativePath $root)"
+        "Java files found: $($files.Count)"
+        ""
+    )
+    $lines += $files | ForEach-Object { Get-RelativePath $_.FullName }
+    return New-ToolText ($lines -join "`n")
+}
+
+function Tool-InspectBuild {
+    param($ToolArgs)
+    $root = Resolve-RepoPath $ToolArgs.projectPath
+    $files = Get-BuildFiles $root
+
+    $mavenProjects = @($files | Where-Object { $_.Name -eq "pom.xml" } | ForEach-Object { Get-RelativePath $_.DirectoryName })
+    $gradleProjects = @($files | Where-Object { $_.Name -like "build.gradle*" } | ForEach-Object { Get-RelativePath $_.DirectoryName })
+
+    $lines = @(
+        "Project: $(Get-RelativePath $root)"
+        "Build files found: $($files.Count)"
+        "",
+        "Maven project folders:",
+        ($(if ($mavenProjects.Count) { $mavenProjects -join "`n" } else { "(none)" })),
+        "",
+        "Gradle project folders:",
+        ($(if ($gradleProjects.Count) { $gradleProjects -join "`n" } else { "(none)" })),
+        "",
+        "Build files:",
+        ($(if ($files.Count) { ($files | ForEach-Object { Get-RelativePath $_.FullName }) -join "`n" } else { "(none)" }))
+    )
+
+    return New-ToolText ($lines -join "`n")
+}
+
+function Tool-CheckKotlinSupport {
+    param($ToolArgs)
+    $root = Resolve-RepoPath $ToolArgs.projectPath
+    $buildFiles = Get-BuildFiles $root
+    $kotlinFiles = Get-KotlinFiles $root
+    $matches = @()
+
+    foreach ($file in $buildFiles) {
+        if ($file.Name -in @("pom.xml", "build.gradle", "build.gradle.kts")) {
+            $content = Read-TextFileSafe $file.FullName
+            if ($content -match "org\.jetbrains\.kotlin|kotlin-maven-plugin|kotlin\(`"jvm`"\)|kotlin-stdlib|kotlin-gradle-plugin") {
+                $matches += "$(Get-RelativePath $file.FullName): Kotlin-related build configuration detected"
+            }
+        }
+    }
+
+    $sourceDirs = @(Get-ChildItem -LiteralPath $root -Recurse -Directory -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-IsIgnoredPath $_.FullName) -and $_.FullName -match "\\src\\(main|test)\\kotlin$" } |
+        ForEach-Object { Get-RelativePath $_.FullName })
+
+    $lines = @(
+        "Project: $(Get-RelativePath $root)"
+        "Kotlin build hints: $($matches.Count)"
+        "Kotlin source dirs: $($sourceDirs.Count)"
+        "Existing .kt files: $($kotlinFiles.Count)"
+        "",
+        "Build hints:",
+        ($(if ($matches.Count) { $matches -join "`n" } else { "(none)" })),
+        "",
+        "Kotlin source dirs:",
+        ($(if ($sourceDirs.Count) { $sourceDirs -join "`n" } else { "(none)" }))
+    )
+
+    return New-ToolText ($lines -join "`n")
+}
+
+function Get-MigrationScore {
+    param([System.IO.FileInfo]$File)
+
+    $path = $File.FullName.ToLowerInvariant()
+    $score = 50
+    $reasons = New-Object System.Collections.Generic.List[string]
+
+    if ($path -match "\\src\\test\\") { $score += 40; $reasons.Add("test file later") }
+    if ($path -match "\\(constant|constants|common|util|utils)\\") { $score -= 25; $reasons.Add("utility/common") }
+    if ($path -match "\\(model|dto|record|records)\\") { $score -= 20; $reasons.Add("model/dto") }
+    if ($path -match "\\(repository|retriever)\\") { $score += 5; $reasons.Add("repository/retriever") }
+    if ($path -match "\\(service|skill|agent|integration)\\") { $score += 15; $reasons.Add("service/agent/integration") }
+    if ($path -match "\\(controller|configuration|configurations|config)\\") { $score += 25; $reasons.Add("controller/config") }
+    if ($File.Name -match "Application\.java$|ServletInitializer\.java$") { $score += 35; $reasons.Add("application/bootstrap") }
+
+    $content = Read-TextFileSafe $File.FullName
+    $projectImportCount = ([regex]::Matches($content, "import\s+com\.")).Count
+    if ($projectImportCount -gt 0) {
+        $score += [Math]::Min($projectImportCount * 2, 20)
+        $reasons.Add("project imports: $projectImportCount")
+    }
+
+    if ($reasons.Count -eq 0) {
+        $reasons.Add("simple candidate")
+    }
+
+    return [ordered]@{
+        score = $score
+        reasons = $reasons -join ", "
+    }
+}
+
+function Tool-PlanMigrationOrder {
+    param($ToolArgs)
+    $root = Resolve-RepoPath $ToolArgs.projectPath
+    $includeTests = if ($null -ne $ToolArgs.includeTests) { [bool]$ToolArgs.includeTests } else { $true }
+    $limit = if ($ToolArgs.limit) { [Math]::Min([int]$ToolArgs.limit, 200) } else { 50 }
+    $files = Get-JavaFiles $root $includeTests 1000
+
+    $ranked = foreach ($file in $files) {
+        $scoreInfo = Get-MigrationScore $file
+        [ordered]@{
+            path = Get-RelativePath $file.FullName
+            score = $scoreInfo.score
+            reason = $scoreInfo.reasons
+        }
+    }
+
+    $ranked = @($ranked | Sort-Object score, path | Select-Object -First $limit)
+
+    $lines = @(
+        "Project: $(Get-RelativePath $root)"
+        "Suggested migration order, safest first:"
+        ""
+    )
+    $index = 1
+    foreach ($item in $ranked) {
+        $lines += "$index. $($item.path) [$($item.reason)]"
+        $index++
+    }
+
+    if ($ranked.Count -eq 0) {
+        $lines += "(no Java files found)"
+    }
+
+    return New-ToolText ($lines -join "`n")
+}
+
+function Tool-MigrationStatus {
+    param($ToolArgs)
+    $root = Resolve-RepoPath $ToolArgs.projectPath
+    $javaFiles = Get-JavaFiles $root $true 5000
+    $kotlinFiles = Get-KotlinFiles $root
+    $buildFiles = Get-BuildFiles $root
+
+    $mainJava = @($javaFiles | Where-Object { $_.FullName -match "\\src\\main\\java\\" })
+    $testJava = @($javaFiles | Where-Object { $_.FullName -match "\\src\\test\\java\\" })
+    $mainKotlin = @($kotlinFiles | Where-Object { $_.FullName -match "\\src\\main\\kotlin\\" })
+    $testKotlin = @($kotlinFiles | Where-Object { $_.FullName -match "\\src\\test\\kotlin\\" })
+
+    $lines = @(
+        "Project: $(Get-RelativePath $root)"
+        "Main Java files: $($mainJava.Count)"
+        "Test Java files: $($testJava.Count)"
+        "Main Kotlin files: $($mainKotlin.Count)"
+        "Test Kotlin files: $($testKotlin.Count)"
+        "Build files: $($buildFiles.Count)"
+        "",
+        "Next suggested files:",
+        ((Tool-PlanMigrationOrder ([pscustomobject]@{ projectPath = $root; includeTests = $false; limit = 10 })).content[0].text)
+    )
+
+    return New-ToolText ($lines -join "`n")
+}
+
+function Tool-RunMaven {
+    param($ToolArgs)
+    $root = Resolve-RepoPath $ToolArgs.projectPath
+    $goal = if ($ToolArgs.goal) { [string]$ToolArgs.goal } else { "test" }
+    $skipTests = if ($null -ne $ToolArgs.skipTests) { [bool]$ToolArgs.skipTests } else { $false }
+
+    if ($goal -notin @("test", "package")) {
+        return New-ToolText "Only Maven goals 'test' and 'package' are allowed." $true
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $root "pom.xml") -PathType Leaf)) {
+        return New-ToolText "No pom.xml found at project path. Pass a Maven module folder as projectPath." $true
+    }
+
+    $mvnw = Join-Path $root "mvnw.cmd"
+    $exe = if (Test-Path -LiteralPath $mvnw -PathType Leaf) { $mvnw } else { "mvn" }
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add("-q")
+    if ($goal -eq "package" -and $skipTests) {
+        $argList.Add("-DskipTests")
+    }
+    $argList.Add($goal)
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $exe
+    $psi.Arguments = $argList -join " "
+    $psi.WorkingDirectory = $root
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    if (-not $process.WaitForExit(120000)) {
+        try { $process.Kill() } catch {}
+        return New-ToolText "Maven command timed out after 120 seconds: $exe $($argList -join ' ')" $true
+    }
+
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $isError = $process.ExitCode -ne 0
+    $text = @"
+Command: $exe $($argList -join ' ')
+Working directory: $(Get-RelativePath $root)
+Exit code: $($process.ExitCode)
+
+STDOUT:
+$stdout
+
+STDERR:
+$stderr
+"@
+
+    return New-ToolText $text $isError
+}
+
+function Get-Tools {
+    return @(
+        [ordered]@{
+            name = "java_kotlin_read_skill"
+            description = "Read the repo-local Java-to-Kotlin migration skill instructions and references list."
+            inputSchema = [ordered]@{ type = "object"; properties = [ordered]@{} }
+        },
+        [ordered]@{
+            name = "java_kotlin_list_java_files"
+            description = "List Java files in a repo folder, scoped to this repository."
+            inputSchema = [ordered]@{
+                type = "object"
+                properties = [ordered]@{
+                    projectPath = [ordered]@{ type = "string"; description = "Optional repo-relative or absolute folder inside the repo." }
+                    includeTests = [ordered]@{ type = "boolean"; description = "Include src/test/java files. Defaults to true." }
+                    maxFiles = [ordered]@{ type = "number"; description = "Maximum files to return. Defaults to 200." }
+                }
+            }
+        },
+        [ordered]@{
+            name = "java_kotlin_inspect_build"
+            description = "Find Maven and Gradle build files under a repo folder."
+            inputSchema = [ordered]@{
+                type = "object"
+                properties = [ordered]@{
+                    projectPath = [ordered]@{ type = "string"; description = "Optional repo-relative or absolute folder inside the repo." }
+                }
+            }
+        },
+        [ordered]@{
+            name = "java_kotlin_check_kotlin_support"
+            description = "Check whether a Maven or Gradle project appears to have Kotlin configured."
+            inputSchema = [ordered]@{
+                type = "object"
+                properties = [ordered]@{
+                    projectPath = [ordered]@{ type = "string"; description = "Optional repo-relative or absolute folder inside the repo." }
+                }
+            }
+        },
+        [ordered]@{
+            name = "java_kotlin_plan_migration_order"
+            description = "Suggest a conservative Java-to-Kotlin migration order, safest files first."
+            inputSchema = [ordered]@{
+                type = "object"
+                properties = [ordered]@{
+                    projectPath = [ordered]@{ type = "string"; description = "Optional repo-relative or absolute folder inside the repo." }
+                    includeTests = [ordered]@{ type = "boolean"; description = "Include test files. Defaults to true." }
+                    limit = [ordered]@{ type = "number"; description = "Maximum suggested files. Defaults to 50." }
+                }
+            }
+        },
+        [ordered]@{
+            name = "java_kotlin_migration_status"
+            description = "Summarize current Java/Kotlin migration status for a repo folder."
+            inputSchema = [ordered]@{
+                type = "object"
+                properties = [ordered]@{
+                    projectPath = [ordered]@{ type = "string"; description = "Optional repo-relative or absolute folder inside the repo." }
+                }
+            }
+        },
+        [ordered]@{
+            name = "java_kotlin_run_maven"
+            description = "Run a guarded Maven test or package command in a Maven module folder."
+            inputSchema = [ordered]@{
+                type = "object"
+                properties = [ordered]@{
+                    projectPath = [ordered]@{ type = "string"; description = "Maven module folder inside the repo." }
+                    goal = [ordered]@{ type = "string"; enum = @("test", "package"); description = "Allowed Maven goal. Defaults to test." }
+                    skipTests = [ordered]@{ type = "boolean"; description = "Only applies to package. Adds -DskipTests." }
+                }
+            }
+        }
+    )
+}
+
+function Invoke-Tool {
+    param([string]$Name, $ToolArgs)
+
+    if ($null -eq $ToolArgs) {
+        $ToolArgs = [pscustomobject]@{}
+    }
+
+    try {
+        switch ($Name) {
+            "java_kotlin_read_skill" { return Tool-ReadSkill }
+            "java_kotlin_list_java_files" { return Tool-ListJavaFiles $ToolArgs }
+            "java_kotlin_inspect_build" { return Tool-InspectBuild $ToolArgs }
+            "java_kotlin_check_kotlin_support" { return Tool-CheckKotlinSupport $ToolArgs }
+            "java_kotlin_plan_migration_order" { return Tool-PlanMigrationOrder $ToolArgs }
+            "java_kotlin_migration_status" { return Tool-MigrationStatus $ToolArgs }
+            "java_kotlin_run_maven" { return Tool-RunMaven $ToolArgs }
+            default { return New-ToolText "Unknown tool: $Name" $true }
+        }
+    } catch {
+        return New-ToolText $_.Exception.Message $true
+    }
+}
+
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {
+        break
+    }
+    if ([string]::IsNullOrWhiteSpace($line)) {
+        continue
+    }
+
+    try {
+        $request = $line | ConvertFrom-Json
+        $id = $request.id
+        $method = [string]$request.method
+        $hasId = $null -ne $id
+
+        switch ($method) {
+            "initialize" {
+                Write-JsonResponse (New-JsonRpcResult $id ([ordered]@{
+                    protocolVersion = $ProtocolVersion
+                    capabilities = [ordered]@{
+                        tools = [ordered]@{}
+                    }
+                    serverInfo = [ordered]@{
+                        name = $ServerName
+                        version = $ServerVersion
+                    }
+                }))
+            }
+            "ping" {
+                Write-JsonResponse (New-JsonRpcResult $id ([ordered]@{}))
+            }
+            "tools/list" {
+                Write-JsonResponse (New-JsonRpcResult $id ([ordered]@{
+                    tools = Get-Tools
+                }))
+            }
+            "tools/call" {
+                $toolName = [string]$request.params.name
+                $arguments = $request.params.arguments
+                $result = Invoke-Tool $toolName $arguments
+                Write-JsonResponse (New-JsonRpcResult $id $result)
+            }
+            default {
+                if ($hasId) {
+                    Write-JsonResponse (New-JsonRpcError $id -32601 "Method not found: $method")
+                }
+            }
+        }
+    } catch {
+        Write-JsonResponse (New-JsonRpcError $null -32700 $_.Exception.Message)
+    }
+}
+
